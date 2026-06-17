@@ -84,6 +84,7 @@ jobs:
           cmake --build build --config Release
 
       - name: ccache-clear
+        continue-on-error: true
         uses: ./.github/actions/ccache-clear
         with:
           key: patched-windows-2022-x64-cuda-13.3-sm89
