@@ -1,0 +1,115 @@
+name: Patched Windows CUDA Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone upstream b9678
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b9678
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: patched-windows-2022-x64-cuda-13.3-sm89
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Apply checkpoint-restore patch
+        shell: pwsh
+        run: |
+          $file = "tools/server/server-context.cpp"
+          $old  = "return cur.pos_min < pos_min_thold || cur.pos_min == 0;"
+          $new  = @'
+          // PATCH: for hybrid/recurrent models such as Qwen3.6,
+          // pos_min can equal the full sequence length, so cur.pos_min < pos_min_thold
+          // can fail and force unnecessary full prompt re-processing.
+          // For these architectures, restore the latest checkpoint that does not extend
+          // past the current position.
+          if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+              return cur.pos_max <= pos_next;
+          }
+          return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+          '@
+
+          $content = Get-Content -Path $file -Raw
+          $escaped = [regex]::Escape($old)
+          $count   = ([regex]::Matches($content, $escaped)).Count
+
+          if ($count -ne 1) {
+              Write-Error "Patch guard FAILED: expected exactly 1 occurrence of target string, found $count. Patch NOT applied."
+              exit 1
+          }
+
+          $result = $content.Replace($old, $new)
+          Set-Content -Path $file -Value $result -NoNewline
+          Write-Host "Patch applied successfully — 1 match replaced."
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=89 ^
+            -DGGML_RPC=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% -t ggml
+          cmake --build build --config Release
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: patched-windows-2022-x64-cuda-13.3-sm89
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          Write-Host "=== build\bin\Release contents ==="
+          Get-ChildItem build\bin\Release
+          Write-Host ""
+
+          $server = "build\bin\Release\llama-server.exe"
+          $dll    = "build\bin\Release\ggml-cuda.dll"
+
+          if (-not (Test-Path $server)) { throw "llama-server.exe not found" }
+          if (-not (Test-Path $dll))    { throw "ggml-cuda.dll not found" }
+
+          Write-Host "llama-server.exe: $((Get-Item $server).Length) bytes"
+          Write-Host "ggml-cuda.dll: $((Get-Item $dll).Length) bytes"
+          Write-Host "Verification passed."
+
+      - name: Pack artifacts
+        run: 7z a -snl patched-llama-server-win-cuda-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: patched-llama-server-win-cuda-x64
+          path: patched-llama-server-win-cuda-x64.zip
